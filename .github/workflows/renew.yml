@@ -20,10 +20,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v6
       with:
         node-version: '24'
 
@@ -45,10 +45,10 @@ jobs:
     timeout-minutes: 40
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v6
       with:
         node-version: '24'
 
@@ -60,7 +60,7 @@ jobs:
         npx playwright install-deps chrome
 
     - name: Restore proxy cooldown cache
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v5
       with:
         path: proxy-cooldown.json
         key: katabump-proxy-cooldown-${{ github.run_id }}
@@ -99,14 +99,14 @@ jobs:
 
     - name: Upload Screenshots
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: screenshots
         path: screenshots/
 
     - name: Save proxy cooldown cache
       if: always()
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v5
       with:
         path: proxy-cooldown.json
         key: katabump-proxy-cooldown-${{ github.run_id }}
