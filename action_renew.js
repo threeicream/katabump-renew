@@ -98,6 +98,7 @@ const CHROME_BOOT_TIMEOUT_DEFAULT_MS = 35_000;
 const CHROME_DIAGNOSTIC_MAX_BYTES = 16 * 1024;
 const CDP_CONNECT_ATTEMPTS = 5;
 const CDP_CONNECT_DELAY_MS = 2_000;
+const SERVER_PAGE_TIMEOUT_MS = 15_000;
 let PROXY_CONFIG = null;
 let PROXY_CONFIG_ERROR = null;
 let DEBUG_PORT = null;
@@ -1335,6 +1336,22 @@ async function getLocatorText(locator) {
     }
 }
 
+/** 只判断当前实际可见的元素，避免把 .altcha-hidden 之类的模板节点当成验证码 */
+async function hasVisibleLocator(locator) {
+    try {
+        const count = await locator.count();
+        for (let index = 0; index < count; index++) {
+            if (await locator.nth(index).isVisible().catch(() => false)) return true;
+        }
+    } catch (e) { }
+    return false;
+}
+
+async function hasVisibleAltcha(modal, modalText) {
+    if (/Protected by ALTCHA/i.test(modalText)) return true;
+    return hasVisibleLocator(modal.locator('altcha-widget, [data-altcha], .altcha'));
+}
+
 /** 保存截图 + HTML 快照 */
 async function dumpDebugSnapshot(page, name) {
     const photoDir = await ensureScreenshotsDir();
@@ -1496,16 +1513,22 @@ async function readExpiryDate(page) {
 //  尝试点击 ALTCHA / Turnstile checkbox（弹窗内）
 // ============================================================
 async function tryClickCaptchaCheckbox(page, modal) {
-    // 策略1: 利用 INJECTED_SCRIPT 注入的 __turnstile_data + CDP 点击
-    const cdpRes = await attemptTurnstileCdp(page);
-    const clickedCdp = !!(cdpRes && (cdpRes.sent === true || cdpRes === true));
-    if (clickedCdp) {
-        console.log('[Captcha] CDP 点击成功，等待验证...');
-        await page.waitForTimeout(3000);
-        return true;
+    // 只有确实存在可见 Turnstile 时才使用 Turnstile 专用的 CDP 点击。
+    // ALTCHA 不应走这个分支，否则会把两种验证机制混在一起。
+    const hasVisibleTurnstile = await hasVisibleLocator(
+        modal.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]')
+    );
+    if (hasVisibleTurnstile) {
+        const cdpRes = await attemptTurnstileCdp(page);
+        const clickedCdp = !!(cdpRes && (cdpRes.sent === true || cdpRes === true));
+        if (clickedCdp) {
+            console.log('[Captcha] CDP 点击成功，等待验证...');
+            await page.waitForTimeout(3000);
+            return true;
+        }
     }
 
-    // 策略2: 在 modal 范围内查找可见的 checkbox 并点击
+    // 策略1: 在 modal 范围内查找可见的 checkbox 并点击
     try {
         const modalBox = await modal.boundingBox();
         const checkboxes = await page.locator('input[type="checkbox"]').all();
@@ -1527,7 +1550,7 @@ async function tryClickCaptchaCheckbox(page, modal) {
         }
     } catch (e) { }
 
-    // 策略3: 尝试在 iframe 中查找并点击 checkbox
+    // 策略2: 尝试在 iframe 中查找并点击 checkbox
     try {
         const frames = page.frames();
         for (const frame of frames) {
@@ -1986,7 +2009,7 @@ async function runMain() {
                 // 如果有 See 按钮，点击它；否则认为已在 dashboard 页面
                 try {
                     const seeBtn = page.getByRole('link', { name: 'See' }).first();
-                    if (await seeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+                    if (await seeBtn.isVisible({ timeout: SERVER_PAGE_TIMEOUT_MS }).catch(() => false)) {
                         await seeBtn.click();
                         console.log('[登录] 已点击 See 按钮。');
                     }
@@ -1998,10 +2021,25 @@ async function runMain() {
                 for (let attempt = 1; attempt <= 20; attempt++) {
                     const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
 
-                    try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { }
+                    try { await renewBtn.waitFor({ state: 'visible', timeout: SERVER_PAGE_TIMEOUT_MS }); } catch (e) { }
 
                     if (!(await renewBtn.isVisible().catch(() => false))) {
-                        console.log('未找到 Renew 按钮 (可能已结束)。');
+                        if (attempt === 1) {
+                            console.log('未找到 Renew 按钮，服务器页面可能仍在加载；刷新一次后重试。');
+                            try {
+                                await page.reload({ waitUntil: 'domcontentloaded', timeout: SERVER_PAGE_TIMEOUT_MS });
+                                await page.waitForTimeout(3000);
+                                const seeBtn = page.getByRole('link', { name: 'See' }).first();
+                                if (await seeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+                                    await seeBtn.click();
+                                    await page.waitForTimeout(3000);
+                                }
+                            } catch (e) {
+                                console.log(`[Renew] 页面刷新失败: ${e.message}`);
+                            }
+                            continue;
+                        }
+                        console.log('未找到 Renew 按钮，页面加载/服务器入口未就绪。');
                         break;
                     }
 
@@ -2030,9 +2068,10 @@ async function runMain() {
 
                     // 识别弹窗验证类型：ALTCHA / CF Turnstile / 无，非 CF 时跳过
                     // 只用强特征，限定当前弹窗
-                    const hasCfInModal = await modal.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0) > 0;
-                    const hasAltchaInModal2 = /Protected by ALTCHA/i.test(modalText)
-                        || await modal.locator('altcha-widget, [data-altcha], .altcha').count().catch(() => 0) > 0;
+                    const hasCfInModal = await hasVisibleLocator(
+                        modal.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]')
+                    );
+                    const hasAltchaInModal2 = await hasVisibleAltcha(modal, modalText);
                     console.log(`[Renew阶段] 弹窗验证类型: ${hasAltchaInModal2 ? 'ALTCHA' : hasCfInModal ? 'CF Turnstile' : '无'}`);
 
                     if (hasCfInModal && !hasAltchaInModal2) {
@@ -2069,8 +2108,7 @@ async function runMain() {
                     }
 
                     // 【ALTCHA 前置检测】modal text 含 ALTCHA 关键词时，必须先完成 checkbox 才能点 confirm
-                    const hasAltchaInModal = /Protected by ALTCHA/i.test(modalText)
-                        || await modal.locator('altcha-widget, [data-altcha], .altcha').count().catch(() => 0) > 0;
+                    const hasAltchaInModal = await hasVisibleAltcha(modal, modalText);
                     if (hasAltchaInModal) {
                         console.log('[ALTCHA] Modal 检测到 ALTCHA/checkbox 验证，先完成验证再点 confirm。');
                         const cbCheckedBefore = await isAltchaCheckboxChecked(page, modal);
